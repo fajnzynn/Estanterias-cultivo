@@ -138,12 +138,13 @@ Los módulos relé con optoacoplador (IN1/IN2 + JD-VCC) típicamente son **activ
 
 ---
 
-## Agregar la humidificadora (futuro)
+## Notas de Desarrollo y Próximos Pasos (Roadmap)
 
-En `config.py` agregás:
-```python
-HUMIDIFICADOR_PIN = 22
-HUM_MIN_PCT = 55.0   # encender si baja de este valor
-```
+El diseño actual está modularizado para permitir escalabilidad. La lógica de control ya corre en hilos separados dentro de `zero_w.py`.
 
-En `zero_w.py` ya está previsto el hilo de ventilación separado del sensor — solo hay que agregar un `hilo_humidificador()` similar.
+- [x] Monitoreo de Temperatura y Humedad (DHT22).
+- [x] Control de ventilación automatizado (Relé).
+- [x] Servidor centralizador y alertas por Telegram.
+- [ ] **Implementar Humidificador (Futuro):**
+  * Modificar `config.py` agregando `HUMIDIFICADOR_PIN = 22` y `HUM_MIN_PCT = 55.0`.
+  * Agregar un `hilo_humidificador()` en `zero_w.py` con una lógica espejo a la de ventilación.

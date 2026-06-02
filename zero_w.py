@@ -2,15 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 zero_w.py — Pi Zero W
-  - Lee DHT22 cada SENSOR_INTERVAL_S segundos
-  - Controla ventiladores: ciclo ACH base + override AND por temp+hum
-  - Envía cada lectura al servidor (Pi 3B+) por HTTP
-  - El override queda "anclado" al sensor que lo disparó hasta que
-    AMBAS condiciones bajen de sus umbrales (con histéresis)
+- Lee DHT22 cada SENSOR_INTERVAL_S segundos
+- Controla ventiladores: ciclo ACH base + override AND por temp+hum
+- Envía cada lectura al servidor (Pi 3B+) por HTTP
+
+CAMBIO v2: evaluar_override es ahora completamente atómico — todo el
+read-evaluate-write sucede dentro de un único bloque con el lock,
+eliminando el race condition de la versión anterior.
 
 Dependencias:
-  pip3 install adafruit-circuitpython-dht RPi.GPIO requests
-  sudo apt-get install libgpiod2
+    pip3 install adafruit-circuitpython-dht RPi.GPIO requests
+    sudo apt-get install libgpiod2
 """
 
 import time
@@ -19,10 +21,8 @@ import signal
 import requests
 import board
 import adafruit_dht
-
 import RPi.GPIO as GPIO
 
-# ── Config ─────────────────────────────────────────────────────────────────
 from config import (
     SERVER_IP, SERVER_PORT,
     RELAY_PINS, ACTIVE_LOW, DHT_PIN,
@@ -34,14 +34,14 @@ from config import (
 SERVER_URL = f"http://{SERVER_IP}:{SERVER_PORT}/lectura"
 
 # ── Estado compartido entre hilos ──────────────────────────────────────────
-_lock = threading.Lock()
+_lock  = threading.Lock()
 _estado = {
-    "temp":            None,   # último valor leído
-    "hum":             None,
-    "override_on":     False,  # ventiladores forzados ON por condición
-    "override_sensor": None,   # qué lectura disparó el override (dict)
-    "fans_on":         False,  # estado actual de los ventiladores
-    "modo":            "ACH",  # "ACH" | "OVERRIDE"
+    "temp":             None,
+    "hum":              None,
+    "override_on":      False,
+    "override_sensor":  None,
+    "fans_on":          False,
+    "modo":             "ACH",
 }
 
 # ── GPIO ───────────────────────────────────────────────────────────────────
@@ -52,12 +52,13 @@ def gpio_setup():
         GPIO.setup(pin, GPIO.OUT, initial=GPIO.HIGH if ACTIVE_LOW else GPIO.LOW)
 
 def _set_fans(encender: bool):
-    """Enciende o apaga todos los ventiladores respetando la lógica activo-bajo."""
-    nivel = (GPIO.LOW if encender else GPIO.HIGH) if ACTIVE_LOW else (GPIO.HIGH if encender else GPIO.LOW)
+    nivel = (GPIO.LOW if encender else GPIO.HIGH) if ACTIVE_LOW \
+            else (GPIO.HIGH if encender else GPIO.LOW)
     for pin in RELAY_PINS:
         GPIO.output(pin, nivel)
-    with _lock:
-        _estado["fans_on"] = encender
+    # Nota: fans_on se actualiza desde el hilo que llama a esta función,
+    # siempre dentro del bloque con _lock adquirido (ver hilo_ventilacion).
+    _estado["fans_on"] = encender
 
 def fans_on():
     _set_fans(True)
@@ -67,70 +68,63 @@ def fans_off():
 
 # ── Cálculo duty-cycle ACH ─────────────────────────────────────────────────
 def calcular_on_s_ventana() -> tuple[float, float]:
-    """
-    Devuelve (on_s_ventana, off_s_ventana) en segundos para el ciclo ACH.
-    """
     caudal_total = CAUDAL_M3H_POR_FAN * len(RELAY_PINS)
-    ach_cont = caudal_total / VOLUMEN_M3
-    frac = min(1.0, ACH_OBJETIVO / ach_cont)
-    ventana_s = VENTANA_MIN * 60
-    on_s  = frac * ventana_s
-    off_s = ventana_s - on_s
+    ach_cont     = caudal_total / VOLUMEN_M3
+    frac         = min(1.0, ACH_OBJETIVO / ach_cont)
+    ventana_s    = VENTANA_MIN * 60
+    on_s         = frac * ventana_s
+    off_s        = ventana_s - on_s
     return on_s, off_s
 
-# ── Lógica de override ─────────────────────────────────────────────────────
+# ── Lógica de override — ATÓMICA ───────────────────────────────────────────
 def evaluar_override(temp: float | None, hum: float | None) -> None:
     """
-    Actualiza el estado de override basándose en la última lectura.
+    Evalúa y actualiza el estado de override en un único bloque atómico.
+    Todo el ciclo read → evaluate → write ocurre con el lock tomado,
+    eliminando la ventana de race condition de la versión anterior donde
+    el lock se liberaba entre la lectura y la escritura del estado.
+
     Reglas:
-      - Activar:   temp > UMBRAL AND hum > UMBRAL
-      - Desactivar: temp <= (UMBRAL - HIST_TEMP) AND hum <= (UMBRAL - HIST_HUM)
-      - Mientras override está activo y el sensor que lo disparó sigue
-        superando algún umbral, no se desactiva aunque otra lectura sea normal.
+      - Activar : temp > UMBRAL AND hum > UMBRAL
+      - Desactivar: temp <= (UMBRAL - HIST) AND hum <= (UMBRAL - HIST)
     """
     if temp is None or hum is None:
         return
 
     with _lock:
         override_activo = _estado["override_on"]
+        cond_alta = temp > TEMP_UMBRAL_C and hum > HUM_UMBRAL_PCT
 
-    cond_alta = temp > TEMP_UMBRAL_C and hum > HUM_UMBRAL_PCT
-
-    if not override_activo and cond_alta:
-        # Activar override
-        lectura_disparo = {"temp": temp, "hum": hum}
-        with _lock:
+        if not override_activo and cond_alta:
             _estado["override_on"]     = True
-            _estado["override_sensor"] = lectura_disparo
+            _estado["override_sensor"] = {"temp": temp, "hum": hum}
             _estado["modo"]            = "OVERRIDE"
-        print(f"[OVERRIDE] Activado — T={temp:.1f}°C  H={hum:.1f}%")
-        return
+            print(f"[OVERRIDE] Activado  — T={temp:.1f}°C H={hum:.1f}%")
+            return
 
-    if override_activo:
-        # Chequear si la condición bajó lo suficiente (con histéresis)
-        cond_baja = (temp <= TEMP_UMBRAL_C - HISTERESIS_TEMP and
-                     hum  <= HUM_UMBRAL_PCT - HISTERESIS_HUM)
-        if cond_baja:
-            with _lock:
+        if override_activo:
+            cond_baja = (
+                temp <= TEMP_UMBRAL_C - HISTERESIS_TEMP and
+                hum  <= HUM_UMBRAL_PCT - HISTERESIS_HUM
+            )
+            if cond_baja:
                 _estado["override_on"]     = False
                 _estado["override_sensor"] = None
                 _estado["modo"]            = "ACH"
-            print(f"[OVERRIDE] Desactivado — T={temp:.1f}°C  H={hum:.1f}%")
+                print(f"[OVERRIDE] Desactivado — T={temp:.1f}°C H={hum:.1f}%")
 
 # ── Hilo: sensor DHT22 ─────────────────────────────────────────────────────
-# Mapeo de pin GPIO BCM → objeto board
 _BCM_A_BOARD = {4: board.D4, 17: board.D17, 27: board.D27}
 
 def hilo_sensor():
     pin_board = _BCM_A_BOARD.get(DHT_PIN, board.D4)
-    sensor = adafruit_dht.DHT22(pin_board)
+    sensor    = adafruit_dht.DHT22(pin_board)
 
     while True:
         try:
             temp = sensor.temperature
             hum  = sensor.humidity
         except RuntimeError:
-            # El DHT22 falla esporádicamente — es normal, reintentar
             time.sleep(2)
             continue
         except Exception as e:
@@ -140,37 +134,38 @@ def hilo_sensor():
 
         if temp is not None and hum is not None:
             temp = round(temp, 1)
-            hum  = round(hum, 1)
+            hum  = round(hum,  1)
+
             with _lock:
                 _estado["temp"] = temp
                 _estado["hum"]  = hum
 
             evaluar_override(temp, hum)
             enviar_lectura(temp, hum)
-            print(f"[DHT] T={temp}°C  H={hum}%  modo={_estado['modo']}")
+            print(f"[DHT] T={temp}°C H={hum}% modo={_estado['modo']}")
 
         time.sleep(SENSOR_INTERVAL_S)
 
 # ── Hilo: ventilación ACH + override ──────────────────────────────────────
 def hilo_ventilacion():
     on_s, off_s = calcular_on_s_ventana()
-    print(f"[VENT] ACH={ACH_OBJETIVO}  on={on_s:.1f}s  off={off_s:.1f}s  (ventana {VENTANA_MIN} min)")
+    print(f"[VENT] ACH={ACH_OBJETIVO} on={on_s:.1f}s off={off_s:.1f}s (ventana {VENTANA_MIN} min)")
 
     while True:
         with _lock:
             override = _estado["override_on"]
 
         if override:
-            # Override activo → ventiladores ON continuamente
-            fans_on()
-            # Revisar cada 5 s si el override se desactivó
+            with _lock:
+                fans_on()
             time.sleep(5)
         else:
-            # Ciclo ACH normal
             if on_s > 0:
-                fans_on()
+                with _lock:
+                    fans_on()
                 time.sleep(on_s)
-            fans_off()
+            with _lock:
+                fans_off()
             time.sleep(off_s if off_s > 0 else 0.5)
 
 # ── Envío al servidor ──────────────────────────────────────────────────────
@@ -181,11 +176,11 @@ def enviar_lectura(temp: float, hum: float) -> None:
         ov_sens = _estado["override_sensor"]
 
     payload = {
-        "temperature":      temp,
-        "humidity":         hum,
-        "fans_on":          fans,
-        "modo":             modo,
-        "override_sensor":  ov_sens,
+        "temperature":     temp,
+        "humidity":        hum,
+        "fans_on":         fans,
+        "modo":            modo,
+        "override_sensor": ov_sens,
     }
     try:
         r = requests.post(SERVER_URL, json=payload, timeout=5)
@@ -196,7 +191,7 @@ def enviar_lectura(temp: float, hum: float) -> None:
     except Exception as e:
         print(f"[HTTP] Error: {e}")
 
-# ── Señales de salida limpia ───────────────────────────────────────────────
+# ── Salida limpia ──────────────────────────────────────────────────────────
 def salir(*_):
     print("\n[SALIR] Apagando ventiladores y limpiando GPIO...")
     fans_off()
